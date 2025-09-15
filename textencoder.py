@@ -169,8 +169,6 @@ class TextEncoder(nn.Module):
         self,
         text_ids: torch.Tensor,                 # (B, N)
         text_mask: Optional[torch.Tensor] = None,   # (B, N) True=keep / False=pad
-        cross_kv: Optional[torch.Tensor] = None,    # (B, M, 512)
-        cross_mask: Optional[torch.Tensor] = None,  # (B, M) True=keep
     ) -> torch.Tensor:
         x = self.embed(text_ids)            # (B, N, 128)
         x = self.in_proj(x)                 # (B, N, 512)

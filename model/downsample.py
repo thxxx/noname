@@ -39,3 +39,21 @@ class SimpleUpsample(nn.Module):
         x = x.unsqueeze(2).expand(-1, -1, self.us, -1)  # (B, T', us, C)
         x = x.reshape(x.size(0), x.size(1) * self.us, -1)  # (B, T'*us, C)
         return x[:, :target_len]
+
+class OutCombiner(nn.Module):
+    """
+    Per-channel residual gate:
+        out = x_orig + (x_proc - x_orig) * s
+            = (1 - s) * x_orig + s * x_proc
+    where s is a learnable vector of shape (C,).
+    """
+    def __init__(self, channels: int, init: float = 0.5, scale_min: float = 0.2, scale_max: float = 1.0):
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((channels,), float(init)))
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+
+    def forward(self, x_orig: torch.Tensor, x_proc: torch.Tensor) -> torch.Tensor:
+        # x_*: (B, T, C)
+        s = torch.clamp(self.scale, self.scale_min, self.scale_max)  # (C,)
+        return x_orig + (x_proc - x_orig) * s  # broadcast to (B, T, C)

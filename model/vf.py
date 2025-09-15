@@ -1,9 +1,9 @@
 import math
 import torch
 import torch.nn as nn
-from newmodel.transformer import MultiHeadAttention
-from newmodel.convnext import ConvNeXt1DBlock
-from newmodel.downsample import SimpleDownsample, SimpleUpsample
+from model.transformer import MultiHeadAttention
+from model.convnext import ConvNeXt1DBlock
+from model.downsample import SimpleDownsample, SimpleUpsample, OutCombiner
 
 def gradtts_time_embedding(t: torch.Tensor, dim: int = 64, max_period: float = 10000.0) -> torch.Tensor:
     """
@@ -61,17 +61,19 @@ class VFEstimator(nn.Module):
         dim_model: int = 256,
         conv_hidden: int = 1024,
         num_heads: int = 4,
-        Nm: int = 4,
+        Nm: int = 5,
         text_dim:int = 128,
         downsample_factors: list = [1, 2, 4, 2, 1]
     ):
         super().__init__()
         self.inp = nn.Linear(dim_in, dim_model)
+        # self.inp = nn.Linear(dim_in*2, dim_model)
 
         self.text_proj = nn.Linear(text_dim, dim_model)
 
         # One set of dilations used inside each main block
         self.dilations = [1, 2, 4, 8]
+        self.downsample_factors = downsample_factors
 
         # Build repeated main blocks
         self.main_blocks = nn.ModuleList()
@@ -87,6 +89,7 @@ class VFEstimator(nn.Module):
                 "upsample": SimpleUpsample(upsample=downsample_factors[i])
             })
             self.main_blocks.append(blocks)
+        self.out_combiners = nn.ModuleList([OutCombiner(dim_model) for _ in range(Nm)])
 
         # Tail: 4 additional ConvNeXt blocks
         self.tail = nn.ModuleList([ConvNeXt1DBlock(dim_model, hidden_dim=conv_hidden) for _ in range(4)])
@@ -95,17 +98,19 @@ class VFEstimator(nn.Module):
 
     def forward(
         self,
-        x_t: torch.Tensor,                 # (B, T, 144)
-        context: torch.Tensor,             # (B, T, 144)
+        x_t: torch.Tensor,                 # (B, 100, T)
+        context: torch.Tensor,             # (B, 100, T)
         times: torch.Tensor,              # (B,) scalarized time (e.g., diffusion/flow t)
         text_embed: torch.Tensor,          # (B, T_text, 256?) -> must be 256; project if needed
         audio_mask: torch.Tensor = None,   # (B, T)
         text_mask: torch.Tensor = None,    # (B, T_text)
     ) -> torch.Tensor:
         """
-        Returns predicted vector field: (B, T, 144)
+        Returns predicted vector field: (B, 100, T)
         Note: If text/ref embeddings are 128-d (as in paper), pass simple linear adapters to 256.
         """
+        # x_t = torch.cat([x_t, context], dim=-1)
+        # x = self.inp(x_t)  # (B, T, 256)
         x = self.inp(x_t)  # (B, T, 256)
 
         # Prepare condition streams (project to model dim if necessary)
@@ -115,7 +120,8 @@ class VFEstimator(nn.Module):
         t_emb = gradtts_time_embedding(times, dim=64)
 
         # Repeated main structure
-        for blk in self.main_blocks:
+        for i, blk in enumerate(self.main_blocks):
+            origin_x = x
             # time cond
             x = blk["time"](x, t_emb)
             # 4 dilated convnext
@@ -130,6 +136,7 @@ class VFEstimator(nn.Module):
 
             # self attn
             x = blk["self"](x, attention_mask=audio_mask)
+            x = self.out_combiners[i](origin_x, x)
 
         # tail convnext x4
         for tblk in self.tail:

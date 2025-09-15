@@ -435,6 +435,12 @@ class EmiliaTokenizer(Tokenizer):
 
         self.vocab_size = len(self.token2id)
         self.has_tokens = True
+    
+        # 토큰 파일이 없는 경우는 스킵
+        if getattr(self, "has_tokens", False):
+            self.id2token: Dict[int, str] = {v: k for k, v in self.token2id.items()}
+        else:
+            self.id2token = {}
 
     def texts_to_token_ids(
         self,
@@ -471,25 +477,128 @@ class EmiliaTokenizer(Tokenizer):
                 all_phoneme += phoneme
             phoneme_list.append(all_phoneme)
         return phoneme_list
+# ----------------------------
+    # IDs -> Tokens -> Text
+    # ----------------------------
+    def token_ids_to_tokens(self, token_ids_list: List[List[int]]) -> List[List[str]]:
+        """
+        Map a batch of token-id sequences back to token strings.
+        OOV id는 스킵.
+        """
+        assert hasattr(self, "id2token"), "id2token not built. Call __post_init_id2token in __init__."
+        out: List[List[str]] = []
+        for ids in token_ids_list:
+            toks: List[str] = []
+            for i in ids:
+                t = self.id2token.get(i, None)
+                if t is None:
+                    logging.debug(f"Skip unknown id {i}")
+                    continue
+                toks.append(t)
+            out.append(toks)
+        return out
 
+    def token_ids_to_texts(self, token_ids_list: List[List[int]]) -> List[str]:
+        """
+        Batch: token ids -> readable text (best-effort detokenization).
+        """
+        tokens_list = self.token_ids_to_tokens(token_ids_list)
+        return [self.tokens_to_text(tokens) for tokens in tokens_list]
+    
+    def tokens_to_text(self, tokens: List[str]) -> str:
+        """
+        Best-effort detokenizer.
+        - KO: ㄱ0 + ㅏ (+ ㄴ) -> '간' 식으로 합성
+        - ZH pinyin: sh0 + uang3 -> "<shuang3>" 로 결합 (가독성 목적)
+        - EN/others: 공백 + 간단한 구두점 공백 정리
+        """
+        pieces: List[str] = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+
+            # 태그는 그대로
+            if self.is_tag(tok):
+                pieces.append(tok)
+                i += 1
+                continue
+
+            # ----- Korean 조합: 초성0 + 중성 (+ 종성)
+            if self._is_korean_initial(tok):
+                cho = tok[:-1]  # remove trailing '0'
+                jung = None
+                jong = None
+
+                # lookahead for jung
+                if i + 1 < len(tokens) and self._is_korean_vowel(tokens[i + 1]):
+                    jung = tokens[i + 1]
+                    i_advance = 2
+
+                    # optional jong
+                    if i + 2 < len(tokens) and self._is_korean_final(tokens[i + 2]):
+                        # 종성 후보가 실제로 합성 가능한 조합일 때만 사용
+                        candidate_jong = tokens[i + 2]
+                        if self._can_compose_korean(cho, jung, candidate_jong):
+                            jong = candidate_jong
+                            i_advance = 3
+
+                    ch = self._compose_hangul(cho, jung, jong)
+                    pieces.append(ch)
+                    i += i_advance
+                    continue
+                else:
+                    # 중성이 없으면 초성 기호 자체를 출력(정보 손실 보호)
+                    pieces.append(cho)
+                    i += 1
+                    continue
+
+            # ----- Chinese pinyin 재결합: initial0 + finals(tone)
+            if self._looks_pinyin_initial(tok):
+                if i + 1 < len(tokens) and self._looks_pinyin_finals(tokens[i + 1]):
+                    p = tok[:-1] + tokens[i + 1]  # 'sh0' + 'uang3' -> 'shuang3'
+                    pieces.append(f"<{p}>")
+                    i += 2
+                    continue
+                else:
+                    # finals가 없으면 그냥 출력
+                    pieces.append(tok)
+                    i += 1
+                    continue
+
+            # finals 단독으로 온 pinyin도 <>로 감쌈
+            if self._looks_pinyin_finals(tok):
+                pieces.append(f"<{tok}>")
+                i += 1
+                continue
+
+            # 그 외: 그냥 추가
+            pieces.append(tok)
+            i += 1
+
+        # 간단한 공백/구두점 정리
+        text = " ".join(pieces)
+        text = (
+            text.replace(" ,", ",")
+                .replace(" .", ".")
+                .replace(" !", "!")
+                .replace(" ?", "?")
+                .replace(" ;", ";")
+                .replace(" :", ":")
+        )
+        # 중괄호/대괄호/꺾쇠 내부 앞뒤 공백 제거
+        text = re.sub(r"\s+([\]\)])", r"\1", text)
+        text = re.sub(r"([\[\(])\s+", r"\1", text)
+        text = re.sub(r"\s+(>)", r"\1", text)
+        text = re.sub(r"(<)\s+", r"\1", text)
+        text = re.sub(r"\s{2,}", " ", text).strip()
+        return text
+    
     # ---- 한국어 토크나이저 ----
     def tokenize_KO(self, text: str) -> List[str]:
         try:
             text = self.korean_normalizer.normalize(text)
             tokens: List[str] = []
             for ch in text:
-                if is_korean_char(ch):
-                    cho, jung, jong = decompose_hangul_syllable(ch)
-                    # 중국어와 동일한 철학: initial에만 '0' suffix
-                    if cho is not None:
-                        tokens.append(cho + "0")      # 예: ㄱ0, ㅂ0 ...
-                    if jung is not None:
-                        tokens.append(jung)           # 예: ㅏ, ㅔ, ㅘ ...
-                    if jong is not None:
-                        tokens.append(jong)           # 예: ㄴ, ㅇ ...
-                else:
-                    # 한글이 아닌 문자는 그대로 둡니다 (공백/숫자/기호 등)
-                    # 필요하면 여기서 숫자를 한국어로 치환하거나 제거 로직을 추가
                     tokens.append(ch)
             return tokens
         except Exception as ex:
@@ -706,6 +815,51 @@ class EmiliaTokenizer(Tokenizer):
             return True
         else:
             return False
+    
+    _KO_CHO = ['ㄱ','ㄲ','ㄴ','ㄷ','ㄸ','ㄹ','ㅁ','ㅂ','ㅃ','ㅅ','ㅆ','ㅇ','ㅈ','ㅉ','ㅊ','ㅋ','ㅌ','ㅍ','ㅎ']
+    _KO_JUNG = ['ㅏ','ㅐ','ㅑ','ㅒ','ㅓ','ㅔ','ㅕ','ㅖ','ㅗ','ㅘ','ㅙ','ㅚ','ㅛ','ㅜ','ㅝ','ㅞ','ㅟ','ㅠ','ㅡ','ㅢ','ㅣ']
+    _KO_JONG = [None,'ㄱ','ㄲ','ㄳ','ㄴ','ㄵ','ㄶ','ㄷ','ㄹ','ㄺ','ㄻ','ㄼ','ㄽ','ㄾ','ㄿ','ㅀ','ㅁ','ㅂ','ㅄ','ㅅ','ㅆ','ㅇ','ㅈ','ㅊ','ㅋ','ㅌ','ㅍ','ㅎ']
+
+    def _is_korean_initial(self, t: str) -> bool:
+        # 초성은 항상 '0' suffix를 붙였다는 규칙 사용 (예: 'ㄱ0')
+        return len(t) >= 2 and t.endswith("0") and (t[:-1] in self._KO_CHO)
+
+    def _is_korean_vowel(self, t: str) -> bool:
+        return t in self._KO_JUNG
+
+    def _is_korean_final(self, t: str) -> bool:
+        # 종성은 None을 제외한 리스트 멤버(복합종성 포함)
+        return t in self._KO_JONG[1:]
+
+    def _can_compose_korean(self, cho: str, jung: str, jong: Optional[str]) -> bool:
+        return (cho in self._KO_CHO) and (jung in self._KO_JUNG) and (jong in self._KO_JONG if (jong is None or isinstance(jong, str)) else False)
+
+    def _compose_hangul(self, cho: str, jung: str, jong: Optional[str]) -> str:
+        """
+        초성/중성/(종성) -> 완성형 한글 합성
+        """
+        try:
+            L = self._KO_CHO.index(cho)
+            V = self._KO_JUNG.index(jung)
+            T = self._KO_JONG.index(jong)  # None -> 0
+            code = 0xAC00 + (L * 21 * 28) + (V * 28) + T
+            return chr(code)
+        except ValueError:
+            # 합성 실패 시 가능한 것만 이어붙임
+            return cho + jung + (jong or "")
+    
+    # pinyin 규칙: initial0, finals(tone digit 1-5)
+    _PINYIN_INITIALS = set([
+        # 표준 한자음 초성 (lazy_pinyin initials)
+        "b","p","m","f","d","t","n","l","g","k","h","j","q","x","zh","ch","sh","r","z","c","s","y","w"
+    ])
+
+    def _looks_pinyin_initial(self, t: str) -> bool:
+        return t.endswith("0") and (t[:-1] in self._PINYIN_INITIALS)
+
+    def _looks_pinyin_finals(self, t: str) -> bool:
+        # tone3 style finals: 알파벳 + 마지막 한 자리 숫자(1~5)
+        return (len(t) >= 2) and t[:-1].isalpha() and (t[-1] in "12345")
 
 
 class DialogTokenizer(EmiliaTokenizer):

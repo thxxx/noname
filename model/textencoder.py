@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from newmodel.convnext import ConvNeXt1DBlock
-from newmodel.transformer import TransformerBlock
+from model.convnext import ConvNeXt1DBlock
+from model.transformer import TransformerBlock
 from typing import Tuple
 
 
@@ -49,8 +49,7 @@ class TextEncoder(nn.Module):
           text_emb: (B, T_text, 128) speaker-adaptive text embeddings
           learned_keys: (50, 128) the learnable key vectors (for reuse in VF estimator)
         """
-        B, T = text_ids.shape
-        x = self.embed(text_ids)  # (B, T, 128)
+        x = self.embed(text_ids.int())  # (B, T, 128)
 
         # 6x ConvNeXt
         for blk in self.convnext:

@@ -38,7 +38,8 @@ class TextMelDataModule(LightningDataModule):
         # alias for clarity
         self.hparams.n_mels = n_feats
 
-    def setup(self):
+    def setup(self, stage):
+        print('stage ; ', stage)
         hp = self.hparams
 
         self.trainset = TextMelDataset(
@@ -106,7 +107,7 @@ class TextMelDataset(torch.utils.data.Dataset):
         n_spks: int,
         n_fft: int = 1024,
         n_mels: int = 100,
-        sample_rate: int = 22050,
+        sample_rate: int = 24000,
         hop_length: int = 256,
         f_min: float = 0.0,
         f_max: float = 8000.0,
@@ -121,7 +122,6 @@ class TextMelDataset(torch.utils.data.Dataset):
 
         self.n_fft = n_fft
         self.n_mels = n_mels
-        self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.f_min = f_min
         self.f_max = f_max
@@ -172,21 +172,25 @@ class TextMelDataset(torch.utils.data.Dataset):
         # audio, sr = ta.load(filepath)  # (C, T)
         # if sr != self.sample_rate:
         #     raise ValueError(f"Sample rate mismatch: got {sr}, expected {self.sample_rate}")
-        mel = self.fbank.extract(torch.from_numpy(audio).float(), self.sample_rate).squeeze(0)  # (n_mels, T')
+        mel = self.fbank.extract(torch.from_numpy(audio).float(), self.sample_rate).squeeze(0) 
         # normalize
         mel = (mel - float(self.data_parameters["mel_mean"])) / float(self.data_parameters["mel_std"])
         return mel  # (n_mels, T')
 
     def __getitem__(self, index: int):
         data = self.dataset[index]
+        audio = data['audio']['array']
+        sr = data['audio']['sampling_rate']
+        if sr != self.sample_rate:
+            resampler = ta.transforms.Resample(sr, self.sample_rate)
+            audio = resampler(torch.from_numpy(audio).float())
+            audio = audio.numpy()
         # filepath, spk, text = self._resolve_fields(self.filepaths_and_text[index])
-        mel = self._get_mel(data['audio']['array'])
+        mel = self._get_mel(audio)
         token_ids = self.tokenizer.texts_to_token_ids([data['text']])[0]
+        # duration = audio.shape[-1]/self.sample_rate
 
-        duration = data['audio']['array'].shape[-1]/self.sample_rate
-
-        return {"x": torch.tensor(token_ids), "y": torch.tensor(mel).transpose(1, 0), "filepath": "filepath", "durations":None}
-        # return {"x": torch.tensor(token_ids), "y": torch.tensor(mel).transpose(1, 0), "filepath": "filepath", "durations": torch.tensor(duration).unsqueeze(0)}
+        return {"x": torch.tensor(token_ids), "y": mel, "durations":None, "text": data['text']}
 
     def __len__(self):
         return len(self.dataset)
@@ -198,33 +202,22 @@ class TextMelBatchCollate:
 
     def __call__(self, batch):
         B = len(batch)
-        y_lengths = [item["y"].shape[-1] for item in batch]
+        y_lengths = [item["y"].shape[-2] for item in batch]
         x_lengths = [item["x"].shape[-1] for item in batch]
+        original_texts = [item["text"] for item in batch]
 
         y_max_len = max(y_lengths)
         x_max_len = max(x_lengths)
-        n_mels = batch[0]["y"].shape[-2]
+        n_mels = batch[0]["y"].shape[-1]
 
         # Padded containers
-        y = torch.zeros((B, n_mels, y_max_len), dtype=torch.float32)
+        y = torch.zeros((B, y_max_len, n_mels), dtype=torch.float32)
         x = torch.zeros((B, x_max_len), dtype=torch.long)
-
-        # Optional durations (token-level)
-        has_durations = batch[0]["durations"] is not None
-        durations = None
-        if has_durations:
-            durations = torch.zeros((B, x_max_len), dtype=torch.long)
-
-        filepaths: List[str] = []
 
         for i, item in enumerate(batch):
             y_i, x_i = item["y"], item["x"]
-            y[:, :, : y_i.shape[-1]][i] = y_i
+            y[:, : y_i.shape[-2], :][i] = y_i
             x[i, : x_i.shape[-1]] = x_i
-            filepaths.append(item["filepath"])
-
-            if has_durations and item["durations"] is not None:
-                durations[i, : item["durations"].shape[-1]] = item["durations"]
 
         y_lengths = torch.tensor(y_lengths, dtype=torch.long)
         x_lengths = torch.tensor(x_lengths, dtype=torch.long)
@@ -234,10 +227,11 @@ class TextMelBatchCollate:
         y_mask = (torch.arange(y_max_len)[None, :].expand(B, -1) < y_lengths[:, None])
 
         batch_out = {
-            "text": x,                              # (B, Lx)
-            "text_mask": x_mask.to(torch.bool),     # (B, Lx)
-            "audio": y,                              # (B, n_mels, Ly)
-            "audio_mask": y_mask.to(torch.bool),     # (B, Ly)
+            "text": x,                              # (B, T_text)
+            "text_mask": x_mask.to(torch.bool),     # (B, T_text)
+            "audio": y,                              # (B, T_audio, n_mels)
+            "audio_mask": y_mask.to(torch.bool),     # (B, T_audio)
+            "original_text": original_texts,
         }
 
         return batch_out

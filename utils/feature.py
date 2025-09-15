@@ -34,7 +34,7 @@ class MelSpectrogramFeatures(nn.Module):
         n_fft=1024,
         hop_length=256,
         f_min=0.0,
-        f_max=8000.0,
+        f_max=12000.0,
     ):
         super().__init__()
 
