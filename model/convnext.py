@@ -7,7 +7,7 @@ class ConvNeXt1DBlock(nn.Module):
         super().__init__()
         padding = (kernel_size // 2) * dilation
         self.dw = nn.Conv1d(dim, dim, kernel_size, padding=padding, dilation=dilation, groups=dim)
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.RMSNorm(dim)
         self.pw1 = nn.Conv1d(dim, hidden_dim, kernel_size=1)
         self.act = nn.GELU()
         self.pw2 = nn.Conv1d(hidden_dim, dim, kernel_size=1)

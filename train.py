@@ -23,12 +23,12 @@ def main():
     
     ds = load_dataset("atmansingh/ljspeech")
 
-    batch_size = 128
+    batch_size = 64
     model_dim = 256
     n_mels = 100
     text_emb_dim = 128
-    max_audio_len = 2000
-    learning_rate = 1e-4
+    max_audio_len = 3000
+    learning_rate = 2e-4
 
     datamodule = TextMelDataModule(
         name="ljspeech",
@@ -38,7 +38,7 @@ def main():
         pin_memory=True,
         n_spks=1,             # LJSpeech = 단일 화자 → 1
         n_fft=1024,
-        n_feats=100,           # mel bins
+        n_feats=n_mels,           # mel bins
         sample_rate=24000,
         hop_length=256,
         f_min=0,

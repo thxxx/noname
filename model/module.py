@@ -17,6 +17,8 @@ from torchdiffeq import odeint
 from model.vocoder import load_vocoder
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.utilities import rank_zero_only
+import random
+import numpy as np
 
 class TTSModule(LightningModule):
     def __init__(
@@ -76,8 +78,9 @@ class TTSModule(LightningModule):
         # --- Mask/Noise 설정 ---
         self.mask_probs = [0.7, 1.0]   # (fmin, fmax) 비율로 사용
         self.sigma = 1e-6
-        self.drop_prob = 0.
-        self.steps = 64
+        self.drop_prob = 0.2
+        self.text_drop_prob = 0.1
+        self.steps = 32
 
         # span mask에서 사용하는 파라미터 이름 통일
         self.mask_fracs = tuple(self.mask_probs)
@@ -104,6 +107,17 @@ class TTSModule(LightningModule):
             for p in self.vocoder.parameters():
                 p.requires_grad_(False)
         self.vocoder.eval()  # 드롭아웃/BN 등 비활성화
+        self.Ke = 2
+
+    def get_timestep(self, batch_size, dtype, device):
+        if random.random()<0.25:
+            t = torch.rand((batch_size, ), dtype=dtype, device=device)
+        else:
+            tnorm = np.random.normal(loc=0, scale=1.0, size=batch_size)
+            t = 1 / (1 + np.exp(-tnorm))
+            t = torch.tensor(t, dtype=dtype, device=device)
+        
+        return t
 
     @torch.compiler.disable
     @torch.no_grad
@@ -140,36 +154,39 @@ class TTSModule(LightningModule):
         text_mask: (B, T_text)  - 1 유효, 0 패딩
         audio_mask: (B, T_audio) - 1 유효, 0 패딩
         """
-        B = text.shape[0]
         text_emb = self.text_encoder(text)  # (B, T_text, text_emb_dim)
+
+        B = text.shape[0]
+        K = int(self.Ke)
+        if K > 1:
+            text_emb = text_emb.repeat_interleave(K, dim=0)
+            audio_mask = audio_mask.repeat_interleave(K, dim=0)
+            text_mask = text_mask.repeat_interleave(K, dim=0)
+            audio = audio.repeat_interleave(K, dim=0)
 
         with torch.no_grad():
             span_mask = self.get_span_mask(audio_mask)  # (B, T_audio)
 
         noise = torch.randn_like(audio)
-        times = torch.rand((B,), dtype=audio.dtype, device=self.device)
+        # times = torch.rand((B,), dtype=audio.dtype, device=self.device)
+        times = self.get_timestep(B*K, audio.dtype, self.device)
         t = rearrange(times, "b -> b () ()")
 
         # linear blend between x0 and gt (sigma는 최소 섞임 보장)
         x_t = (1 - (1 - self.sigma) * t) * noise + t * audio
 
         # dropout-style condition mask
-        cond_drop_mask = prob_mask_like((B, 1), self.drop_prob, self.device)  # (B,1)
+        cond_drop_mask = prob_mask_like((B*K, 1), self.drop_prob, self.device)  # (B,1)
         audio_cond_mask = span_mask | cond_drop_mask  # (B, T_audio)
 
         audio_context = torch.where(
             rearrange(audio_cond_mask, "b l -> b l ()"),
-            torch.zeros_like(audio),
-            audio,
+            torch.zeros_like(audio), # True면 여기
+            audio, # False면 여기
         )
 
-        phon_drop_mask = prob_mask_like((B,), self.drop_prob, self.device)  # (B,)
-        # text_emb = torch.where(
-        #     rearrange(phon_drop_mask, "b -> b () ()"),
-        #     torch.zeros_like(text_emb),
-        #     text_emb,
-        # )
-
+        if random.random() < self.text_drop_prob:
+            text_emb = torch.zeros_like(text_emb, device=text_emb.device)
 
         # === 예: VFEstimator의 시그니처가 아래와 같다고 가정 ===
         # pred_audio_flow: (B, T_audio, n_mels)
@@ -183,7 +200,7 @@ class TTSModule(LightningModule):
         )
 
         target_audio_flow = audio - (1 - self.sigma) * noise
-        loss = masked_loss(pred_audio_flow, target_audio_flow, audio_mask, "mse")
+        loss = masked_loss(pred_audio_flow, target_audio_flow, audio_cond_mask, "mse")
         return loss
     
     @torch.no_grad()
@@ -194,13 +211,15 @@ class TTSModule(LightningModule):
         def fn(t, y):
             times = t.expand(B)
 
-            out = self.vf_estimator(
+            out = self.vf_estimator.forward_cfg(
                 x_t=y,
-                times=times,
-                audio_mask=audio_mask,
                 context=torch.zeros_like(y),
+                times=times,
                 text_embed=text_emb,
-                text_mask=text_mask
+                audio_mask=audio_mask,
+                text_mask=text_mask,
+                guidance_scale=3.0,
+                concat=False
             )
             return out
 
@@ -242,6 +261,11 @@ class TTSModule(LightningModule):
             self.on_sample(batch)
         return {"val_loss": loss}
     
+    # @rank_zero_only
+    # @torch.no_grad()
+    # def on_metric(self, batch):
+    #     text, audio, text_mask, audio_mask, original_text = self._parse_batch(batch)   # audio: (B, T, n_mels)
+
     @rank_zero_only
     @torch.no_grad()
     def on_sample(self, batch):

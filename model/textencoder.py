@@ -35,6 +35,10 @@ class TextEncoder(nn.Module):
             [ConvNeXt1DBlock(emb_dim, hidden_dim=conv_hidden, kernel_size=5) for _ in range(num_convnext)]
         )
 
+        self.layer_norms = nn.ModuleList(
+            [nn.LayerNorm(emb_dim) for _ in range(num_sa_blocks)]
+        )
+
         self.sa_blocks = nn.ModuleList(
             [TransformerBlock(emb_dim, num_heads=sa_heads, ff_hidden=sa_ff) for _ in range(num_sa_blocks)]
         )
@@ -56,7 +60,7 @@ class TextEncoder(nn.Module):
             x = blk(x)
 
         # 4x Self-Attention (Transformer) with RoPE
-        for blk in self.sa_blocks:
-            x = blk(x, text_attention_mask)
+        for blk, ln in zip(self.sa_blocks, self.layer_norms):
+            x = x + blk(ln(x), text_attention_mask)
 
         return x

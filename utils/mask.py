@@ -14,6 +14,12 @@ def prob_mask_like(
         case _:
             return torch.rand(shape, device=device) < prob
 
+# def prob_mask_like(embed, prob: float, device: torch.device):
+#     # prob 확률로 전체가 zeros, 아니면 전체가 ones
+#     if torch.rand(()) < prob:
+#         return torch.zeros_like(embed, device=device, dtype=torch.bool)
+#     else:
+#         return embed
 
 def mask_from_fracs(lengths: torch.Tensor, fmin: float, fmax: float, max_len: int):
     batch = lengths.shape[0]
